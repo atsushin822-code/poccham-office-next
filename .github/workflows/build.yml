@@ -1,30 +1,450 @@
-Run set -euo pipefail
+name: build
 
-added 28 packages in 3s
+# Poccham Office Next - one workflow: test -> installers -> checksums -> release.
+# Keep this file ASCII-only. Non-ASCII text once got mangled on the way into the
+# repository and GitHub reported a bogus "yaml syntax error on line 11".
+#
+# Artefacts produced:
+#   Windows : *-setup.exe (NSIS installer) / *-portable.zip (portable exe)
+#   macOS   : *.dmg (Intel x86_64 and Apple Silicon, both built on macos-15)
+#   Linux   : *.AppImage / *.deb / *.rpm
+#   common  : SHA256SUMS.txt
 
-8 packages are looking for funding
-  run `npm fund` for details
-node:fs:440
-    return binding.readFileUtf8(path, stringToFlags(options.flag));
-                   ^
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
 
-Error: ENOENT: no such file or directory, open '/home/runner/work/poccham-office-next/poccham-office-next/crates/poc-ui/dist/index.html'
-    at Object.readFileSync (node:fs:440:20)
-    at Object.<anonymous> (/home/runner/work/poccham-office-next/poccham-office-next/scripts/ui_smoke_test.js:28:17)
-    at Module._compile (node:internal/modules/cjs/loader:1781:14)
-    at Object..js (node:internal/modules/cjs/loader:1913:10)
-    at Module.load (node:internal/modules/cjs/loader:1505:32)
-    at Function._load (node:internal/modules/cjs/loader:1309:12)
-    at wrapModuleLoad (node:internal/modules/cjs/loader:254:19)
-    at Function.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:171:5)
-    at node:internal/main/run_main_module:36:49 {
-  errno: -2,
-  code: 'ENOENT',
-  syscall: 'open',
-  path: '/home/runner/work/poccham-office-next/poccham-office-next/crates/poc-ui/dist/index.html'
-}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
-Node.js v22.23.5
-Error: Process completed with exit code 1.
-0s
-0s
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Force UTF-8 for Python on every runner. The Windows runner defaults to
+  # cp1252, which raises UnicodeEncodeError as soon as a script prints
+  # non-ASCII text.
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+  # Version used in artefact names, identical for local builds and CI.
+  APP_VERSION: 0.9.0
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ------------------------------------------------------------------ tests
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve source root
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "resolve-sources: rev4"
+
+          workspace_toml() { grep -q '\[workspace\]' "$1" 2>/dev/null; }
+
+          find_source() {
+            local f
+            while IFS= read -r f; do
+              if workspace_toml "${f}"; then dirname "${f}"; return 0; fi
+            done < <(find . -maxdepth 6 -name Cargo.toml \
+                       -not -path "./.git/*" -not -path "*/target/*" \
+                       -not -path "*/node_modules/*" | sort)
+            return 1
+          }
+
+          hoist() {
+            local src="$1" entry name
+            shopt -s nullglob dotglob
+            for entry in "${src}"/*; do
+              name="$(basename "${entry}")"
+              if [ -d "${entry}" ] && [ -d "${name}" ]; then
+                cp -R "${entry}"/. "${name}"/
+                rm -rf "${entry}"
+              else
+                rm -rf "${name}"
+                mv "${entry}" .
+              fi
+            done
+            shopt -u nullglob dotglob
+          }
+
+          resolve() {
+            if [ -f Cargo.toml ]; then
+              echo "OK: Cargo.toml is already at the repository root"
+              return 0
+            fi
+            local src
+            if ! src="$(find_source)"; then return 1; fi
+            echo "Moving sources from ${src} to the repository root"
+            hoist "${src}"
+            find . -mindepth 1 -maxdepth 6 -type d -empty \
+              -not -path "./.git/*" -not -path "*/target/*" -delete 2>/dev/null || true
+            if [ -f Cargo.toml ]; then return 0; fi
+            return 1
+          }
+
+          if ! resolve; then
+            ZIP=$(find . -maxdepth 3 -name "*.zip" -not -path "./.git/*" -print -quit 2>/dev/null || true)
+            if [ -n "${ZIP}" ]; then
+              echo "Extracting ${ZIP} into the repository root"
+              unzip -q -o "${ZIP}" -d . 2>/dev/null || tar -xf "${ZIP}" -C . || true
+              resolve || true
+            fi
+          fi
+
+          if [ ! -f Cargo.toml ]; then
+            echo "::error::Cargo.toml not found. Put the contents of the release zip at the repository root."
+            echo "--- repository root ---"
+            ls -la
+            echo "--- repository tree (depth 2) ---"
+            find . -maxdepth 2 -not -path "./.git*" | head -60
+            echo "--- Cargo.toml locations (depth 6) ---"
+            find . -maxdepth 6 -name Cargo.toml -not -path "./.git/*" || true
+            exit 1
+          fi
+
+          echo "source root: $(pwd)"
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Workflow consistency check
+        run: python3 scripts/ci/check_workflow.py
+
+      - name: Required files check
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for f in Cargo.toml Cargo.lock README.md LICENSE \
+                   crates/poc-ui/ui/index.html \
+                   scripts/ui_smoke_test.js scripts/verify_ooxml.py \
+                   crates/poc-ui/src-tauri/tauri.conf.json; do
+            if [ ! -s "$f" ]; then
+              echo "::error::$f is missing (is it committed to git?)"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "--- repository root ---"
+            ls -la
+            echo "--- index.html locations ---"
+            find . -maxdepth 4 -name 'index.html' -not -path './.git/*' || true
+            echo "--- .gitignore ---"
+            cat .gitignore || true
+            exit 1
+          fi
+          echo "required files OK: $(wc -c < crates/poc-ui/ui/index.html) bytes of UI"
+
+      - name: Build and unit/integration tests
+        run: cargo test --workspace --all-targets
+
+      - name: Formatting check
+        run: cargo fmt --all -- --check
+
+      - name: Static analysis (clippy)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: CLI smoke test
+        run: |
+          set -euo pipefail
+          cargo build --release -p poc-cli
+          BIN=target/release/poc
+          if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
+          WORK="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/poc-cli"
+          mkdir -p "$WORK"
+          "$BIN" version
+          "$BIN" new "$WORK/report.xlsx"
+          "$BIN" new "$WORK/memo.docx"
+          "$BIN" new "$WORK/deck.pptx"
+          "$BIN" info "$WORK/report.xlsx"
+          "$BIN" convert "$WORK/report.xlsx" "$WORK/report.ods"
+          "$BIN" convert "$WORK/report.ods" "$WORK/back.xlsx"
+          "$BIN" calc "$WORK/back.xlsx"
+          "$BIN" bench --cells 20000 > /dev/null
+
+      - name: OOXML compatibility check (openpyxl / python-docx / python-pptx)
+        run: |
+          set -euo pipefail
+          cargo build --release -p poc-cli
+          BIN=target/release/poc
+          if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
+          PY=$(command -v python3 || command -v python)
+          # A system Python on macOS / recent Linux cannot pip install into
+          # itself (PEP 668 externally-managed-environment), so use a venv.
+          # Create it under the cwd so all three OS bash shells agree on the path.
+          "$PY" -m venv .ci-venv
+          VPY=".ci-venv/bin/python"
+          if [ ! -x "$VPY" ]; then VPY=".ci-venv/Scripts/python.exe"; fi
+          "$VPY" -m pip install --quiet --disable-pip-version-check \
+            openpyxl python-docx python-pptx
+          POC_BIN="$BIN" "$VPY" scripts/verify_ooxml.py
+          rm -rf .ci-venv
+
+      - name: UI smoke test (jsdom)
+        run: |
+          set -euo pipefail
+          npm install --no-save --no-package-lock jsdom
+          node scripts/ui_smoke_test.js
+
+  # ------------------------------------------------------- desktop bundles
+  bundle:
+    name: package (${{ matrix.label }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            args: "--bundles nsis"
+          - label: macos-intel
+            os: macos-15            # cross-build the Intel dmg on Apple Silicon
+            target: x86_64-apple-darwin
+            args: "--target x86_64-apple-darwin --bundles dmg"
+          - label: macos-apple-silicon
+            os: macos-15
+            target: aarch64-apple-darwin
+            args: "--target aarch64-apple-darwin --bundles dmg"
+          - label: linux-x64
+            os: ubuntu-22.04        # glibc 2.35 baseline for older distributions
+            target: x86_64-unknown-linux-gnu
+            args: "--bundles appimage,deb,rpm"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve source root
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "resolve-sources: rev4"
+
+          workspace_toml() { grep -q '\[workspace\]' "$1" 2>/dev/null; }
+
+          find_source() {
+            local f
+            while IFS= read -r f; do
+              if workspace_toml "${f}"; then dirname "${f}"; return 0; fi
+            done < <(find . -maxdepth 6 -name Cargo.toml \
+                       -not -path "./.git/*" -not -path "*/target/*" \
+                       -not -path "*/node_modules/*" | sort)
+            return 1
+          }
+
+          hoist() {
+            local src="$1" entry name
+            shopt -s nullglob dotglob
+            for entry in "${src}"/*; do
+              name="$(basename "${entry}")"
+              if [ -d "${entry}" ] && [ -d "${name}" ]; then
+                cp -R "${entry}"/. "${name}"/
+                rm -rf "${entry}"
+              else
+                rm -rf "${name}"
+                mv "${entry}" .
+              fi
+            done
+            shopt -u nullglob dotglob
+          }
+
+          resolve() {
+            if [ -f Cargo.toml ]; then
+              echo "OK: Cargo.toml is already at the repository root"
+              return 0
+            fi
+            local src
+            if ! src="$(find_source)"; then return 1; fi
+            echo "Moving sources from ${src} to the repository root"
+            hoist "${src}"
+            find . -mindepth 1 -maxdepth 6 -type d -empty \
+              -not -path "./.git/*" -not -path "*/target/*" -delete 2>/dev/null || true
+            if [ -f Cargo.toml ]; then return 0; fi
+            return 1
+          }
+
+          if ! resolve; then
+            ZIP=$(find . -maxdepth 3 -name "*.zip" -not -path "./.git/*" -print -quit 2>/dev/null || true)
+            if [ -n "${ZIP}" ]; then
+              echo "Extracting ${ZIP} into the repository root"
+              unzip -q -o "${ZIP}" -d . 2>/dev/null || tar -xf "${ZIP}" -C . || true
+              resolve || true
+            fi
+          fi
+
+          if [ ! -f Cargo.toml ]; then
+            echo "::error::Cargo.toml not found. Put the contents of the release zip at the repository root."
+            echo "--- repository root ---"
+            ls -la
+            echo "--- repository tree (depth 2) ---"
+            find . -maxdepth 2 -not -path "./.git*" | head -60
+            echo "--- Cargo.toml locations (depth 6) ---"
+            find . -maxdepth 6 -name Cargo.toml -not -path "./.git/*" || true
+            exit 1
+          fi
+
+          echo "source root: $(pwd)"
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/poc-ui/src-tauri -> target
+
+      - name: Linux build dependencies (WebKitGTK)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev patchelf \
+            libayatana-appindicator3-dev file rpm
+
+      - name: Build and bundle with Tauri
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: crates/poc-ui/src-tauri
+          args: ${{ matrix.args }}
+
+      # ---------------------------------------------------- Windows: portable
+      - name: Create the Windows portable build
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $target = "crates/poc-ui/src-tauri/target"
+          $exe = Get-ChildItem -Path $target -Filter "*.exe" -Recurse -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -match "[\\/]release[\\/]" -and
+                                $_.FullName -notmatch "[\\/]bundle[\\/]" -and
+                                $_.Name -notmatch "setup|uninst" } |
+                 Sort-Object LastWriteTime -Descending |
+                 Select-Object -First 1
+          if (-not $exe) { throw "exe not found (searched: $target)" }
+          Write-Host "bundling exe: $($exe.FullName)"
+
+          Remove-Item -Path stage -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path stage | Out-Null
+          Copy-Item -Path $exe.FullName -Destination "stage/Poccham Office Next.exe" -Force
+
+          # Pass one path at a time: a comma list with a stray positional
+          # argument makes PowerShell fail with "A positional parameter cannot be found".
+          foreach ($item in @("README.md", "LICENSE", "docs", "NOTICE")) {
+            if (Test-Path -LiteralPath $item) {
+              Copy-Item -Path $item -Destination stage -Recurse -Force
+            }
+          }
+          Get-ChildItem -Path stage | Select-Object Name, Length
+
+          $zip = "Poccham-Office-Next-${env:APP_VERSION}-${{ matrix.label }}-portable.zip"
+          Compress-Archive -Path "stage/*" -DestinationPath $zip -Force
+          if (-not (Test-Path -LiteralPath $zip)) { throw "could not create the portable zip" }
+          Get-Item -LiteralPath $zip | Select-Object Name, Length
+
+      # --------------------------------------------------- collect artefacts
+      - name: Collect artefacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # With --target <triple> the output lands in target/<triple>/release/bundle,
+          # so collect from the whole repository instead of hard-coding a path.
+          find . -path ./.git -prune -o -path ./out -prune -o -type f \
+            \( -name '*.exe' -o -name '*.msi' -o -name '*.dmg' -o -name '*.deb' \
+               -o -name '*.rpm' -o -name '*.AppImage' \
+               -o -name 'Poccham-Office-Next-*-portable.zip' \) -print0 |
+          while IFS= read -r -d '' f; do
+            case "${f}" in
+              */bundle/*|*portable.zip) cp -f "${f}" out/ ;;
+            esac
+          done
+          ls -la out
+          if [ -z "$(ls -A out)" ]; then
+            echo "::error::No bundle artefacts found (the Tauri build produced nothing)."
+            echo "--- bundle directories ---"
+            find . -type d -name bundle -not -path "./.git/*" | head -20 || true
+            echo "--- release directories under target ---"
+            find . -type d -path "*target*" -name release -not -path "./.git/*" | head -20 || true
+            exit 1
+          fi
+
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd out
+          if [ -z "$(ls -A)" ]; then
+            echo "::error::out is empty (check the collect-artefacts step)."
+            ls -la
+            exit 1
+          fi
+          SUM="SHA256SUMS-${{ matrix.label }}.txt"
+          set -- *
+          if command -v sha256sum > /dev/null 2>&1; then sha256sum "$@" > "${SUM}"; else shasum -a 256 "$@" > "${SUM}"; fi
+          cat "${SUM}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------- release
+  release:
+    name: create release
+    needs: bundle
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Combine SHA256 of all files
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd artifacts
+          rm -f SHA256SUMS.txt
+          if [ -z "$(ls -A)" ]; then
+            echo "::error::No downloaded artefacts."
+            exit 1
+          fi
+          : > SHA256SUMS.txt
+          for f in *; do
+            [ -f "$f" ] || continue
+            case "$f" in SHA256SUMS*.txt) continue ;; esac   # skip per-job copies
+            sha256sum "$f" >> SHA256SUMS.txt
+          done
+          cat SHA256SUMS.txt
+
+      - name: Attach to the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Poccham Office Next ${{ github.ref_name }}
+          draft: true
+          generate_release_notes: true
+          files: artifacts/*
