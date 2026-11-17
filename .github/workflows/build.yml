@@ -47,24 +47,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ソースがサブフォルダにネストしていても (zip をそのまま展開した場合など)
-      # 以降のステップがリポジトリのルートで動くように正規化します。
-      # ソースがリポジトリ直下に無い場合 (zip を展開したフォルダごと push した、
-      # zip をそのままコミットした、など) に、自動でルートへ持ってきます。
       - name: ソースのルートを解決
         shell: bash
         run: |
           set -euo pipefail
+          echo "ソース解決ステップ: rev4"
 
-          # 中身を $src からカレント (リポジトリのルート) へ移動する
+          workspace_toml() { grep -q '\[workspace\]' "$1" 2>/dev/null; }
+
+          find_source() {
+            local f
+            while IFS= read -r f; do
+              if workspace_toml "${f}"; then dirname "${f}"; return 0; fi
+            done < <(find . -maxdepth 6 -name Cargo.toml \
+                       -not -path "./.git/*" -not -path "*/target/*" \
+                       -not -path "*/node_modules/*" | sort)
+            return 1
+          }
+
           hoist() {
-            local src="$1"
+            local src="$1" entry name
             shopt -s nullglob dotglob
             for entry in "${src}"/*; do
-              local name
               name="$(basename "${entry}")"
               if [ -d "${entry}" ] && [ -d "${name}" ]; then
-                # 既にあるフォルダ (.github など) は中身を統合する
                 cp -R "${entry}"/. "${name}"/
                 rm -rf "${entry}"
               else
@@ -75,68 +81,51 @@ jobs:
             shopt -u nullglob dotglob
           }
 
-          # 「[workspace] を持つ Cargo.toml」があるディレクトリを浅い順に探す
-          find_source() {
-            local f dir
-            while IFS= read -r f; do
-              if grep -q '\[workspace\]' "${f}" 2>/dev/null; then
-                dirname "${f}"
-                return 0
-              fi
-            done < <(find . -maxdepth 4 -name Cargo.toml \
-                       -not -path "*/target/*" -not -path "./.git/*" | sort)
-            return 1
-          }
-
           resolve() {
             if [ -f Cargo.toml ]; then
               echo "OK: Cargo.toml はリポジトリのルートにあります"
               return 0
             fi
             local src
-            if src="$(find_source)"; then
-              echo "ソースを ${src} からルートへ移動します"
-              hoist "${src}"
-              # 空になった入れ子フォルダを片付ける
-              find . -mindepth 1 -maxdepth 4 -type d -empty \
-                -not -path "./.git/*" -not -path "*/target/*" -delete 2>/dev/null || true
-              [ -f Cargo.toml ]
-              return
-            fi
+            if ! src="$(find_source)"; then return 1; fi
+            echo "ソースを ${src} からリポジトリのルートへ移動します"
+            hoist "${src}"
+            find . -mindepth 1 -maxdepth 6 -type d -empty \
+              -not -path "./.git/*" -not -path "*/target/*" -delete 2>/dev/null || true
+            if [ -f Cargo.toml ]; then return 0; fi
             return 1
           }
 
-          if resolve; then
-            exit 0
-          fi
-
-          # zip がコミットされている場合はその場で展開して再挑戦する
-          ZIP=$(find . -maxdepth 2 -name "*.zip" -not -path "./.git/*" -print -quit 2>/dev/null || true)
-          if [ -n "${ZIP}" ]; then
-            echo "${ZIP} をリポジトリ直下に展開します"
-            if command -v unzip > /dev/null; then
-              unzip -q -o "${ZIP}" -d . || true
-            else
-              tar -xf "${ZIP}" -C . || true
-            fi
-            if resolve; then
-              exit 0
+          if ! resolve; then
+            ZIP=$(find . -maxdepth 3 -name "*.zip" -not -path "./.git/*" -print -quit 2>/dev/null || true)
+            if [ -n "${ZIP}" ]; then
+              echo "${ZIP} をリポジトリ直下に展開します"
+              unzip -q -o "${ZIP}" -d . 2>/dev/null || tar -xf "${ZIP}" -C . || true
+              resolve || true
             fi
           fi
 
-          echo "::error::Cargo.toml が見つかりませんでした。リポジトリ直下に Cargo.toml / crates / scripts を置くか、配布 zip をリポジトリ直下で展開してください。"
-          echo "--- ルートの中身 ---"
-          ls -la
-          echo "--- Cargo.toml の場所 (深さ 4 まで) ---"
-          find . -maxdepth 4 -name Cargo.toml -not -path "*/.git/*" -not -path "*/target/*" || true
-          exit 1
+          if [ ! -f Cargo.toml ]; then
+            echo "::error::Cargo.toml が見つかりませんでした。配布 zip の中身をリポジトリ直下に置いてください。"
+            echo "--- ルートの中身 ---"
+            ls -la
+            echo "--- リポジトリのツリー (深さ 2) ---"
+            find . -maxdepth 2 -not -path "./.git*" | head -60
+            echo "--- Cargo.toml の場所 (深さ 6) ---"
+            find . -maxdepth 6 -name Cargo.toml -not -path "./.git/*" || true
+            exit 1
+          fi
 
+          echo "ソースのルート: $(pwd)"
       - name: Rust ツールチェーン
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: ワークフロー定義の一貫性チェック
+        run: python3 scripts/ci/check_workflow.py
 
       - name: ビルド & ユニット/統合テスト
         run: cargo test --workspace --all-targets
@@ -153,7 +142,7 @@ jobs:
           cargo build --release -p poc-cli
           BIN=target/release/poc
           if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
-          WORK="$RUNNER_TEMP/poc-cli"
+          WORK="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/poc-cli"
           mkdir -p "$WORK"
           "$BIN" version
           "$BIN" new "$WORK/report.xlsx"
@@ -217,28 +206,76 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ソースがサブフォルダにネストしていても (zip をそのまま展開した場合など)
-      # 以降のステップがリポジトリのルートで動くように正規化します。
       - name: ソースのルートを解決
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f Cargo.toml ]; then
-            echo "OK: Cargo.toml はリポジトリのルートにあります"
-            exit 0
-          fi
-          shopt -s nullglob
-          for d in */; do
-            if [ -f "${d}Cargo.toml" ]; then
-              echo "ネストしたフォルダ ${d} の内容をルートへ移動します"
-              find "${d}" -mindepth 1 -maxdepth 1 -exec mv {} . \;
-              rmdir "${d}"
-              exit 0
-            fi
-          done
-          echo "Cargo.toml が見つかりません。リポジトリ直下に Cargo.toml を置いてください。" >&2
-          exit 1
+          echo "ソース解決ステップ: rev4"
 
+          workspace_toml() { grep -q '\[workspace\]' "$1" 2>/dev/null; }
+
+          find_source() {
+            local f
+            while IFS= read -r f; do
+              if workspace_toml "${f}"; then dirname "${f}"; return 0; fi
+            done < <(find . -maxdepth 6 -name Cargo.toml \
+                       -not -path "./.git/*" -not -path "*/target/*" \
+                       -not -path "*/node_modules/*" | sort)
+            return 1
+          }
+
+          hoist() {
+            local src="$1" entry name
+            shopt -s nullglob dotglob
+            for entry in "${src}"/*; do
+              name="$(basename "${entry}")"
+              if [ -d "${entry}" ] && [ -d "${name}" ]; then
+                cp -R "${entry}"/. "${name}"/
+                rm -rf "${entry}"
+              else
+                rm -rf "${name}"
+                mv "${entry}" .
+              fi
+            done
+            shopt -u nullglob dotglob
+          }
+
+          resolve() {
+            if [ -f Cargo.toml ]; then
+              echo "OK: Cargo.toml はリポジトリのルートにあります"
+              return 0
+            fi
+            local src
+            if ! src="$(find_source)"; then return 1; fi
+            echo "ソースを ${src} からリポジトリのルートへ移動します"
+            hoist "${src}"
+            find . -mindepth 1 -maxdepth 6 -type d -empty \
+              -not -path "./.git/*" -not -path "*/target/*" -delete 2>/dev/null || true
+            if [ -f Cargo.toml ]; then return 0; fi
+            return 1
+          }
+
+          if ! resolve; then
+            ZIP=$(find . -maxdepth 3 -name "*.zip" -not -path "./.git/*" -print -quit 2>/dev/null || true)
+            if [ -n "${ZIP}" ]; then
+              echo "${ZIP} をリポジトリ直下に展開します"
+              unzip -q -o "${ZIP}" -d . 2>/dev/null || tar -xf "${ZIP}" -C . || true
+              resolve || true
+            fi
+          fi
+
+          if [ ! -f Cargo.toml ]; then
+            echo "::error::Cargo.toml が見つかりませんでした。配布 zip の中身をリポジトリ直下に置いてください。"
+            echo "--- ルートの中身 ---"
+            ls -la
+            echo "--- リポジトリのツリー (深さ 2) ---"
+            find . -maxdepth 2 -not -path "./.git*" | head -60
+            echo "--- Cargo.toml の場所 (深さ 6) ---"
+            find . -maxdepth 6 -name Cargo.toml -not -path "./.git/*" || true
+            exit 1
+          fi
+
+          echo "ソースのルート: $(pwd)"
       - name: Rust ツールチェーン
         uses: dtolnay/rust-toolchain@stable
         with:
