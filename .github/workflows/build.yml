@@ -316,24 +316,45 @@ jobs:
 
       # ------------------------------------------------- 成果物を 1 箇所に集約
       - name: 成果物を集約
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p out
-          B=crates/poc-ui/src-tauri/target/release/bundle
-          for f in "$B"/nsis/*.exe "$B"/dmg/*.dmg "$B"/deb/*.deb "$B"/rpm/*.rpm "$B"/appimage/*.AppImage; do
-            if [ -e "$f" ]; then cp -R "$f" out/; fi
-          done
-          for f in Poccham-Office-Next-*-portable.zip; do
-            if [ -e "$f" ]; then cp "$f" out/; fi
+          # `--target <triple>` を付けると出力先は target/<triple>/release/bundle に
+          # 変わるため、パスを決め打ちせずリポジトリ全体から拾います。
+          find . -path ./.git -prune -o -path ./out -prune -o -type f \
+            \( -name '*.exe' -o -name '*.msi' -o -name '*.dmg' -o -name '*.deb' \
+               -o -name '*.rpm' -o -name '*.AppImage' \
+               -o -name 'Poccham-Office-Next-*-portable.zip' \) -print0 |
+          while IFS= read -r -d '' f; do
+            case "${f}" in
+              */bundle/*|*portable.zip) cp -f "${f}" out/ ;;
+            esac
           done
           ls -la out
+          if [ -z "$(ls -A out)" ]; then
+            echo "::error::バンドル成果物が見つかりませんでした（Tauri のビルド結果が空です）。"
+            echo "--- bundle ディレクトリ ---"
+            find . -type d -name bundle -not -path "./.git/*" | head -20 || true
+            echo "--- target 配下の release ディレクトリ ---"
+            find . -type d -path "*target*" -name release -not -path "./.git/*" | head -20 || true
+            exit 1
+          fi
 
       - name: チェックサム
+        shell: bash
         run: |
           set -euo pipefail
           cd out
-          if command -v sha256sum > /dev/null; then sha256sum * > SHA256SUMS.txt; else shasum -a 256 * > SHA256SUMS.txt; fi
-          cat SHA256SUMS.txt
+          if [ -z "$(ls -A)" ]; then
+            echo "::error::out が空です（成果物を集約するステップを確認してください）。"
+            ls -la
+            exit 1
+          fi
+          SUM="SHA256SUMS-${{ matrix.label }}.txt"
+          set -- *
+          if command -v sha256sum > /dev/null 2>&1; then sha256sum "$@" > "${SUM}"; else shasum -a 256 "$@" > "${SUM}"; fi
+          cat "${SUM}"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -357,11 +378,22 @@ jobs:
           merge-multiple: true
 
       - name: 全ファイルの SHA256 をまとめる
+        shell: bash
         run: |
           set -euo pipefail
           cd artifacts
           rm -f SHA256SUMS.txt
-          sha256sum * | tee SHA256SUMS.txt
+          if [ -z "$(ls -A)" ]; then
+            echo "::error::ダウンロードした成果物がありません。"
+            exit 1
+          fi
+          : > SHA256SUMS.txt
+          for f in *; do
+            [ -f "$f" ] || continue
+            case "$f" in SHA256SUMS*.txt) continue ;; esac   # 各ジョブの控えは除外
+            sha256sum "$f" >> SHA256SUMS.txt
+          done
+          cat SHA256SUMS.txt
 
       - name: GitHub リリースへ添付
         uses: softprops/action-gh-release@v2
