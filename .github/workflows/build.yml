@@ -42,6 +42,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ソースがサブフォルダにネストしていても (zip をそのまま展開した場合など)
+      # 以降のステップがリポジトリのルートで動くように正規化します。
+      - name: ソースのルートを解決
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f Cargo.toml ]; then
+            echo "OK: Cargo.toml はリポジトリのルートにあります"
+            exit 0
+          fi
+          shopt -s nullglob dotglob
+          for d in */; do
+            [ -f "${d}Cargo.toml" ] || continue
+            echo "ネストしたフォルダ ${d} の内容をルートへ移動します"
+            for entry in "${d}"*; do
+              name="${entry#"${d}"}"
+              if [ -d "${entry}" ] && [ -d "${name}" ]; then
+                # 既にあるフォルダ (.github など) は中身を統合する
+                cp -R "${entry}"/. "${name}"/
+                rm -rf "${entry}"
+              else
+                rm -rf "${name}"
+                mv "${entry}" .
+              fi
+            done
+            rmdir "${d}"
+            exit 0
+          done
+          echo "Cargo.toml が見つかりません。リポジトリ直下に Cargo.toml を置いてください。" >&2
+          exit 1
+
       - name: Rust ツールチェーン
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -119,6 +150,28 @@ jobs:
             args: "--bundles appimage,deb,rpm"
     steps:
       - uses: actions/checkout@v4
+
+      # ソースがサブフォルダにネストしていても (zip をそのまま展開した場合など)
+      # 以降のステップがリポジトリのルートで動くように正規化します。
+      - name: ソースのルートを解決
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f Cargo.toml ]; then
+            echo "OK: Cargo.toml はリポジトリのルートにあります"
+            exit 0
+          fi
+          shopt -s nullglob
+          for d in */; do
+            if [ -f "${d}Cargo.toml" ]; then
+              echo "ネストしたフォルダ ${d} の内容をルートへ移動します"
+              find "${d}" -mindepth 1 -maxdepth 1 -exec mv {} . \;
+              rmdir "${d}"
+              exit 0
+            fi
+          done
+          echo "Cargo.toml が見つかりません。リポジトリ直下に Cargo.toml を置いてください。" >&2
+          exit 1
 
       - name: Rust ツールチェーン
         uses: dtolnay/rust-toolchain@stable
