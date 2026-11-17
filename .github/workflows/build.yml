@@ -23,6 +23,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # 日本語のログをどの OS でもそのまま出せるようにする
+  # (Windows ランナーの既定コードページは cp1252 で、これが無いと
+  #  Python の print() が UnicodeEncodeError になります)
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
   # ローカルビルドと CI で同じ成果物名にするための基準バージョン
   APP_VERSION: 0.9.0
 
@@ -167,8 +172,16 @@ jobs:
           BIN=target/release/poc
           if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
           PY=$(command -v python3 || command -v python)
-          "$PY" -m pip install --quiet openpyxl python-docx python-pptx
-          POC_BIN="$BIN" "$PY" scripts/verify_ooxml.py
+          # macOS / 最近の Linux のシステム Python は pip install できない
+          # (PEP 668 externally-managed-environment) ので venv を作る。
+          # 3 OS の bash から同じ相対パスで扱えるよう、カレント配下に作る。
+          "$PY" -m venv .ci-venv
+          VPY=".ci-venv/bin/python"
+          if [ ! -x "$VPY" ]; then VPY=".ci-venv/Scripts/python.exe"; fi
+          "$VPY" -m pip install --quiet --disable-pip-version-check \
+            openpyxl python-docx python-pptx
+          POC_BIN="$BIN" "$VPY" scripts/verify_ooxml.py
+          rm -rf .ci-venv
 
       - name: UI スモークテスト (jsdom)
         run: |
