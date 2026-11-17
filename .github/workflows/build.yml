@@ -1,0 +1,216 @@
+name: build
+
+# Poccham Office Next — 1 本のワークフローで「テスト → 全プラットフォームの
+# インストーラ作成 → チェックサム → リリース添付」まで通します。
+#
+# 生成物
+#   Windows : *-setup.exe (NSIS インストーラ) / *-portable.zip (単体 exe)
+#   macOS   : *.dmg (Intel x86_64) / *.dmg (Apple Silicon aarch64)
+#   Linux   : *.AppImage / *.deb / *.rpm
+#   共通    : SHA256SUMS.txt
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # ローカルビルドと CI で同じ成果物名にするための基準バージョン
+  APP_VERSION: 0.9.0
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ------------------------------------------------------------------ tests
+  test:
+    name: テスト (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust ツールチェーン
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: ビルド & ユニット/統合テスト
+        run: cargo test --workspace --all-targets
+
+      - name: 整形チェック
+        run: cargo fmt --all -- --check
+
+      - name: 静的解析 (clippy)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: CLI スモークテスト
+        run: |
+          set -euo pipefail
+          cargo build --release -p poc-cli
+          BIN=target/release/poc
+          if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
+          WORK="$RUNNER_TEMP/poc-cli"
+          mkdir -p "$WORK"
+          "$BIN" version
+          "$BIN" new "$WORK/report.xlsx"
+          "$BIN" new "$WORK/memo.docx"
+          "$BIN" new "$WORK/deck.pptx"
+          "$BIN" info "$WORK/report.xlsx"
+          "$BIN" convert "$WORK/report.xlsx" "$WORK/report.ods"
+          "$BIN" convert "$WORK/report.ods" "$WORK/back.xlsx"
+          "$BIN" calc "$WORK/back.xlsx"
+          "$BIN" bench --cells 20000 > /dev/null
+
+      - name: OOXML 互換性検証 (openpyxl / python-docx / python-pptx)
+        run: |
+          set -euo pipefail
+          cargo build --release -p poc-cli
+          BIN=target/release/poc
+          if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
+          PY=$(command -v python3 || command -v python)
+          "$PY" -m pip install --quiet openpyxl python-docx python-pptx
+          POC_BIN="$BIN" "$PY" scripts/verify_ooxml.py
+
+      - name: UI スモークテスト (jsdom)
+        run: |
+          set -euo pipefail
+          npm install --no-save --no-package-lock jsdom
+          node scripts/ui_smoke_test.js
+
+  # ------------------------------------------------------- desktop bundles
+  bundle:
+    name: パッケージ (${{ matrix.label }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            args: "--bundles nsis"
+          - label: macos-intel
+            os: macos-15-intel      # GitHub で唯一の Intel (x86_64) ランナー
+            target: x86_64-apple-darwin
+            args: "--target x86_64-apple-darwin --bundles dmg"
+          - label: macos-apple-silicon
+            os: macos-15
+            target: aarch64-apple-darwin
+            args: "--target aarch64-apple-darwin --bundles dmg"
+          - label: linux-x64
+            os: ubuntu-22.04        # glibc 2.35 / 古めのディストリでも動く基準
+            target: x86_64-unknown-linux-gnu
+            args: "--bundles appimage,deb,rpm"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust ツールチェーン
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/poc-ui/src-tauri -> target
+
+      - name: Linux のビルド依存 (WebKitGTK)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev patchelf \
+            libayatana-appindicator3-dev file rpm
+
+      - name: Tauri でビルド & バンドル
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: crates/poc-ui/src-tauri
+          args: ${{ matrix.args }}
+
+      # ---------------------------------------------------- Windows: portable
+      - name: Windows ポータブル版を作成
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path "crates/poc-ui/src-tauri/target/release" -Filter "*.exe" |
+                 Where-Object { $_.Name -notmatch "setup|uninst" } | Select-Object -First 1
+          if (-not $exe) { throw "exe が見つかりません" }
+          New-Item -ItemType Directory -Force -Path stage | Out-Null
+          Copy-Item $exe.FullName "stage/Poccham Office Next.exe"
+          Copy-Item README.md, LICENSE docs -Destination stage -Recurse -ErrorAction SilentlyContinue
+          Compress-Archive -Path stage/* -DestinationPath "Poccham-Office-Next-${{ env.APP_VERSION }}-windows-x64-portable.zip" -Force
+
+      # ------------------------------------------------- 成果物を 1 箇所に集約
+      - name: 成果物を集約
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          B=crates/poc-ui/src-tauri/target/release/bundle
+          for f in "$B"/nsis/*.exe "$B"/dmg/*.dmg "$B"/deb/*.deb "$B"/rpm/*.rpm "$B"/appimage/*.AppImage; do
+            if [ -e "$f" ]; then cp -R "$f" out/; fi
+          done
+          for f in Poccham-Office-Next-*-portable.zip; do
+            if [ -e "$f" ]; then cp "$f" out/; fi
+          done
+          ls -la out
+
+      - name: チェックサム
+        run: |
+          set -euo pipefail
+          cd out
+          if command -v sha256sum > /dev/null; then sha256sum * > SHA256SUMS.txt; else shasum -a 256 * > SHA256SUMS.txt; fi
+          cat SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------- release
+  release:
+    name: リリース作成
+    needs: bundle
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: 全ファイルの SHA256 をまとめる
+        run: |
+          set -euo pipefail
+          cd artifacts
+          rm -f SHA256SUMS.txt
+          sha256sum * | tee SHA256SUMS.txt
+
+      - name: GitHub リリースへ添付
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Poccham Office Next ${{ github.ref_name }}
+          draft: true
+          generate_release_notes: true
+          files: artifacts/*
