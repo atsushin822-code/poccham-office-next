@@ -306,13 +306,33 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $exe = Get-ChildItem -Path "crates/poc-ui/src-tauri/target/release" -Filter "*.exe" |
-                 Where-Object { $_.Name -notmatch "setup|uninst" } | Select-Object -First 1
-          if (-not $exe) { throw "exe が見つかりません" }
+          $target = "crates/poc-ui/src-tauri/target"
+          $exe = Get-ChildItem -Path $target -Filter "*.exe" -Recurse -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -match "[\\/]release[\\/]" -and
+                                $_.FullName -notmatch "[\\/]bundle[\\/]" -and
+                                $_.Name -notmatch "setup|uninst" } |
+                 Sort-Object LastWriteTime -Descending |
+                 Select-Object -First 1
+          if (-not $exe) { throw "exe が見つかりません (探した場所: $target)" }
+          Write-Host "同梱する exe: $($exe.FullName)"
+
+          Remove-Item -Path stage -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path stage | Out-Null
-          Copy-Item $exe.FullName "stage/Poccham Office Next.exe"
-          Copy-Item README.md, LICENSE docs -Destination stage -Recurse -ErrorAction SilentlyContinue
-          Compress-Archive -Path stage/* -DestinationPath "Poccham-Office-Next-${{ env.APP_VERSION }}-windows-x64-portable.zip" -Force
+          Copy-Item -Path $exe.FullName -Destination "stage/Poccham Office Next.exe" -Force
+
+          # パスは 1 つずつ渡す（カンマ区切り＋位置引数は PowerShell が
+          # "A positional parameter cannot be found" で失敗する原因になる）
+          foreach ($item in @("README.md", "LICENSE", "docs", "NOTICE")) {
+            if (Test-Path -LiteralPath $item) {
+              Copy-Item -Path $item -Destination stage -Recurse -Force
+            }
+          }
+          Get-ChildItem -Path stage | Select-Object Name, Length
+
+          $zip = "Poccham-Office-Next-${env:APP_VERSION}-${{ matrix.label }}-portable.zip"
+          Compress-Archive -Path "stage/*" -DestinationPath $zip -Force
+          if (-not (Test-Path -LiteralPath $zip)) { throw "ポータブル zip を作成できませんでした" }
+          Get-Item -LiteralPath $zip | Select-Object Name, Length
 
       # ------------------------------------------------- 成果物を 1 箇所に集約
       - name: 成果物を集約
